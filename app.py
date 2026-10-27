@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import requests
 import os
+from api_client import load_master_data
 
 # =========================================================
 # [Part 1] 설정 및 환경 세팅
@@ -93,24 +94,14 @@ def main():
     st.title("🍎 오르락내리락")
     st.caption("실시간 식재료 가격 변동 및 맞춤형 대체재 추천 서비스")
 
-    # 데이터 로드
-    @st.cache_data
-    def get_all_data():
-        # 테스트용 데이터 (실제 API 연동 시 대체)
-        api_data = {
-            '품목명': ['상추', '깻잎', '양배추', '치커리', '양파', '고춧가루', '호박'],
-            'rate_1d': [45.0, -2.0, 5.0, 10.0, 35.0, 10.0, 50.0],
-            'rate_1m': [60.0, 5.0, 2.0, 8.0, 40.0, 5.0, 55.0]
-        }
-        meta_data = {
-            '품목명': ['상추', '깻잎', '양배추', '치커리', '양파', '고춧가루', '호박'],
-            '조리 용도': ['쌈채소', '쌈채소', '쌈채소', '쌈채소', '양념류', '양념류', '식감채소']
-        }
-        return pd.DataFrame(api_data), pd.DataFrame(meta_data)
-
-    api_df, metadata_df = get_all_data()
-    master_df = pd.merge(api_df, metadata_df, on='품목명', how='left')
+    # 실시간 API + 58개 메타데이터 통합
+    master_df, base_date, warn_msg = load_master_data(METADATA_FILE)
+    if base_date:
+        st.caption(f"📅 데이터 기준일: {base_date[:4]}-{base_date[4:6]}-{base_date[6:]}")
+    if warn_msg:
+        st.warning(warn_msg)
     result_df = run_grade_logic(master_df)
+
 
     # [요구사항 3] 사이드바 메뉴 순서: 홈 -> 서비스 소개 -> 챗봇 구독하기
     st.sidebar.header("📂 메뉴")
@@ -138,6 +129,10 @@ def main():
                         st.write(f"**품목:** {row['품목명']}")
                         st.write(f"**추천:** `{row['recommend_target']}`")
                         st.caption(f"이유: {row['reason']}")
+                        
+                        basis = result_df.loc[result_df['품목명'] == row['recommend_target'], 'price_basis']
+                        if not basis.empty and basis.iloc[0] == '중도매':
+                            st.caption("*중도매가 기준이므로 소매가와 다를 수 있습니다*")
 
         st.divider()
 
@@ -190,7 +185,7 @@ def main():
         
         st.write("---")
         user_id = st.text_input("본인의 텔레그램 Chat ID를 입력하세요", value=MY_CHAT_ID)
-        selected_items = st.multiselect("알림을 받고 싶은 품목을 선택하세요", sorted(api_df['품목명'].unique()))
+        selected_items = st.multiselect("알림을 받고 싶은 품목을 선택하세요", sorted(master_df['품목명'].unique()))
         
         # [요구사항 2] 알림 조건 선택
         alert_option = st.radio(
