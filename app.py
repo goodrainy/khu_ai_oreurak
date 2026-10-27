@@ -4,6 +4,7 @@ import json
 import requests
 import os
 from api_client import load_master_data
+from llm_message import card_message
 
 # =========================================================
 # [Part 1] 설정 및 환경 세팅
@@ -148,7 +149,7 @@ def main():
                             st.markdown("### 🚨 3등급 (최후)")
                         st.write(f"**품목:** {row['품목명']}")
                         st.write(f"**추천:** `{row['recommend_target']}`")
-                        st.caption(f"이유: {row['reason']}")
+                        st.caption(f"이유: {card_message(row, result_df)}")
                         
                         basis = result_df.loc[result_df['품목명'] == row['recommend_target'], 'price_basis']
                         if not basis.empty and basis.iloc[0] == '중도매':
