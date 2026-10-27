@@ -55,15 +55,27 @@ def _fetch_category(ctgry_cd, ymd, key, num_rows=1000):
 
 
 def _fetch_all_with_fallback(ctgry_codes, key):
-    """오늘 → 하루씩 과거로 후퇴하며 '데이터가 나오는 첫 날짜'의 전체 데이터를 반환."""
+    """
+    오늘 → 하루씩 과거로 후퇴하며,
+    '데이터가 있고 + 1일/1개월 등락률이 충분히 채워진 첫 날짜'의 전체 데이터를 반환.
+    (월요일처럼 전날 시세가 없으면 1일 등락률이 null로 와서 그 날짜는 건너뜀)
+    """
     today = datetime.now()
     for back in range(MAX_FALLBACK_DAYS + 1):
         ymd = (today - timedelta(days=back)).strftime("%Y%m%d")
         all_items = []
         for cd in ctgry_codes:
             all_items.extend(_fetch_category(cd, ymd, key))
-        if all_items:
+        if not all_items:
+            continue  # 휴장일 등 데이터 없음 → 이전 날짜로
+
+        # 1일/1개월 등락률이 채워진 행의 비율 계산
+        total = len(all_items)
+        ok_1d = sum(1 for it in all_items if it.get("dd1_bfr_cmpr_rafrt") not in (None, ""))
+        ok_1m = sum(1 for it in all_items if it.get("mm1_bfr_cmpr_rafrt") not in (None, ""))
+        if ok_1d / total >= 0.5 and ok_1m / total >= 0.5:
             return all_items, ymd
+        print(f"[건너뜀] {ymd}: 1일 등락률 {ok_1d}/{total}, 1개월 등락률 {ok_1m}/{total}")
     return [], None
 
 
