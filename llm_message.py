@@ -72,7 +72,7 @@ def _ask_llm(facts_text):
             {"role": "user", "content": facts_text},
         ],
         "temperature": 0.3,
-        "max_tokens": 200,
+        "max_tokens": 1500,
     }
     res = requests.post(
         GATEWAY_URL,
@@ -80,7 +80,11 @@ def _ask_llm(facts_text):
         json=body, timeout=TIMEOUT_SEC,
     )
     res.raise_for_status()
-    return res.json()["choices"][0]["message"]["content"].strip()
+    text = res.json()["choices"][0]["message"]["content"]
+    if not text or not text.strip():
+        raise RuntimeError(f"빈 응답 (finish_reason={res.json()['choices'][0].get('finish_reason')})")
+    return text.strip()
+
 
 
 # ---------- 4. 최종 문구 만들기 (app.py에서 이 함수를 호출) ----------
