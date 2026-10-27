@@ -32,8 +32,8 @@ def send_telegram_message(token, chat_id, message):
     except Exception as e:
         print(f"🚨 전송 중 에러: {e}")
 
-def run_grade_logic(df, group_col='조리 용도', name_col='품목명', 
-                    threshold_1d=5.0, threshold_1m=5.0):
+def run_grade_logic(df, group_col='조리 용도', name_col='품목명',
+                    threshold_1d=5.0, threshold_1m=5.0, fallback_top_n=5):
     df = df.copy()
     df[group_col] = df[group_col].astype(str).str.strip()
     df[name_col] = df[name_col].astype(str).str.strip()
@@ -41,26 +41,46 @@ def run_grade_logic(df, group_col='조리 용도', name_col='품목명',
     df['recommend_target'] = ''
     df['reason'] = ''
 
-    for idx, row in df.iterrows():
-        if row['rate_1d'] >= threshold_1d and row['rate_1m'] >= threshold_1m:
-            df.at[idx, 'recommend_grade'] = '급등'
-            target_group = row[group_col]
-            candidates = df[(df[group_col] == target_group) & (df.index != idx)]
-            
-            if candidates.empty:
-                grade, target, reason = '3등급(최후)', '메뉴 변경 권장', f"[{target_group}] 내 대체 품목 없음"
-            else:
-                candidates = candidates.copy()
-                candidates['score'] = (candidates['rate_1d'] * 0.4) + (candidates['rate_1m'] * 0.6)
-                best = candidates.sort_values(by='score').iloc[0]
-                if best['score'] < threshold_1d * 0.5:
-                    grade, target, reason = '1등급(최선)', best[name_col], f"{best[name_col]}는 추세가 매우 안정적입니다."
-                else:
-                    grade, target, reason = '2등급(차선)', best[name_col], f"{best[name_col]}도 상승 중이나 상대적으로 완만합니다."
+    # 변동 점수: 1일 40% + 1개월 60% (설문 결과 나오면 조정)
+    df['score'] = (df['rate_1d'] * 0.4) + (df['rate_1m'] * 0.6)
 
-            df.at[idx, 'recommend_grade'] = grade
-            df.at[idx, 'recommend_target'] = target
-            df.at[idx, 'reason'] = reason
+    # 급등 여부 (기존 기준 그대로)
+    df['is_surge'] = (df['rate_1d'] >= threshold_1d) & (df['rate_1m'] >= threshold_1m)
+
+    # 추천 대상 1순위: 급등 품목
+    target_idx = list(df[df['is_surge']].index)
+
+    # 급등이 부족하면, 점수가 높은(많이 오르는) 품목으로 채움
+    if len(target_idx) < fallback_top_n:
+        others = df[(~df['is_surge']) & (df['score'] > 0)]
+        need = fallback_top_n - len(target_idx)
+        target_idx += list(others.nlargest(need, 'score').index)
+
+    for idx in target_idx:
+        row = df.loc[idx]
+        tag = '급등' if row['is_surge'] else '상승 상위'
+        target_group = row[group_col]
+
+        # 같은 조리 용도 안의 후보 (자기 자신 제외, 데이터 없는 품목 제외)
+        candidates = df[(df[group_col] == target_group) & (df.index != idx)]
+        if 'has_data' in candidates.columns:
+            candidates = candidates[candidates['has_data']]
+
+        if candidates.empty:
+            grade, target = '3등급(최후)', '메뉴 변경 권장'
+            reason = f"[{tag}] [{target_group}] 내 대체 품목 없음"
+        else:
+            best = candidates.sort_values(by='score').iloc[0]
+            if best['score'] < threshold_1d * 0.5:
+                grade, target = '1등급(최선)', best[name_col]
+                reason = f"[{tag}] {best[name_col]}는 추세가 매우 안정적입니다."
+            else:
+                grade, target = '2등급(차선)', best[name_col]
+                reason = f"[{tag}] {best[name_col]}도 상승 중이나 상대적으로 완만합니다."
+
+        df.at[idx, 'recommend_grade'] = grade
+        df.at[idx, 'recommend_target'] = target
+        df.at[idx, 'reason'] = reason
     return df
 
 def subscribe_item(chat_id, item_name, alert_type):
@@ -142,7 +162,7 @@ def main():
         # 메트릭 섹션
         m_col1, m_col2, m_col3 = st.columns(3)
         with m_col1:
-            spikes = len(result_df[result_df['recommend_grade'] == '급등'])
+            spikes = int(result_df['is_surge'].sum())
             st.metric("🚨 현재 급등 품목", f"{spikes}개")
         with m_col2:
             avg_rate = result_df['rate_1d'].mean()
