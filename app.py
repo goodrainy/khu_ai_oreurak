@@ -15,13 +15,18 @@ TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
 MY_CHAT_ID = st.secrets["MY_CHAT_ID"]
 SUBSCRIBERS_FILE = 'subscribers.json'
 METADATA_FILE = '품목58선_최종_통합본.xlsx'
-MAX_CARDS = 9  # 추천 카드 최대 표시 개수
+MAX_CARDS = 9
 
 GRADE_LABEL_MAP = {
     '1등급(최선)': '✅ 적극 추천',
     '2등급(차선)': '🔄 참고 추천',
     '3등급(최후)': '🚫 대체 어려움',
     '정상': '-',
+}
+ALERT_LABEL_MAP = {
+    '급등': '🔴 급등',
+    '1차 경고': '🟡 1차 경고',
+    '정상': '정상',
 }
 
 # =========================================================
@@ -125,7 +130,8 @@ def subscribe_item(chat_id, item_name, alert_type):
 # =========================================================
 
 def render_card(row, result_df):
-    """추천 카드 1장을 그려줌. 등락률 비교 차트는 즉시, AI 이유는 버튼 눌렀을 때만."""
+    """추천 카드 1장을 그려줌. 이유/그래프는 버튼을 눌렀을 때만 펼쳐짐."""
+    item_name = row['품목명']
     with st.container(border=True):
         if row['is_surge']:
             alert_badge = "🔴 급등"
@@ -133,7 +139,7 @@ def render_card(row, result_df):
             alert_badge = "🟡 1차 경고"
         else:
             alert_badge = "📈 상승 상위"
-        st.markdown(f"##### {alert_badge} · {row['품목명']}")
+        st.markdown(f"##### {alert_badge} · {item_name}")
 
         targets = [t.strip() for t in str(row['recommend_target']).split(',') if t.strip()]
         target_display = ", ".join(targets) if targets else row['recommend_target']
@@ -144,17 +150,6 @@ def render_card(row, result_df):
             st.warning(f"🔄 참고 추천: **{target_display}**")
         else:
             st.error(f"🚫 대체 어려움 → {target_display}")
-
-        # [Explainable AI] 등락률 비교 차트 — 급등 품목 vs 대체재
-        if targets:
-            chart_df = pd.DataFrame(index=['1일 등락률(%)', '1개월 등락률(%)'])
-            chart_df[row['품목명']] = [row['rate_1d'], row['rate_1m']]
-            for t in targets:
-                t_row = result_df[result_df['품목명'] == t]
-                if not t_row.empty:
-                    tr = t_row.iloc[0]
-                    chart_df[t] = [tr['rate_1d'], tr['rate_1m']]
-            st.bar_chart(chart_df)
 
         # 절감액 안내 (1순위 대체재 기준)
         if targets:
@@ -167,14 +162,34 @@ def render_card(row, result_df):
                     if diff > 0:
                         st.caption(f"💰 {targets[0]}로 바꾸면 약 {diff:,.0f}원 절감돼요")
 
-        # 이유는 버튼을 눌렀을 때만 ChatKHU 호출
-        reason_key = f"reason_{row['품목명']}"
-        if st.session_state.get(reason_key):
-            st.caption(f"이유: {st.session_state[reason_key]}")
-        else:
-            if st.button("💬 이유 보기", key=f"btn_{row['품목명']}"):
+        # [변경] 이유 보기 / 그래프 보기 버튼을 나란히 배치
+        reason_key = f"reason_{item_name}"
+        chart_key = f"chart_{item_name}"
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            if st.button("💬 이유 보기", key=f"btn_reason_{item_name}"):
                 st.session_state[reason_key] = card_message(row, result_df)
                 st.rerun()
+        with btn_col2:
+            if targets:
+                chart_label = "📊 그래프 숨기기" if st.session_state.get(chart_key) else "📊 그래프 보기"
+                if st.button(chart_label, key=f"btn_chart_{item_name}"):
+                    st.session_state[chart_key] = not st.session_state.get(chart_key, False)
+                    st.rerun()
+
+        if st.session_state.get(reason_key):
+            st.caption(f"이유: {st.session_state[reason_key]}")
+
+        # [변경] 막대그래프 → 선그래프 (우상향 흐름이 잘 보이게)
+        if targets and st.session_state.get(chart_key):
+            chart_df = pd.DataFrame(index=['1일 등락률(%)', '1개월 등락률(%)'])
+            chart_df[item_name] = [row['rate_1d'], row['rate_1m']]
+            for t in targets:
+                t_row = result_df[result_df['품목명'] == t]
+                if not t_row.empty:
+                    tr = t_row.iloc[0]
+                    chart_df[t] = [tr['rate_1d'], tr['rate_1m']]
+            st.line_chart(chart_df)
 
         if targets:
             basis = result_df.loc[result_df['품목명'] == targets[0], 'price_basis']
@@ -187,17 +202,17 @@ def main():
     st.caption("실시간 식재료 가격 변동 및 맞춤형 대체재 추천 서비스")
 
     master_df, base_date, warn_msg = load_master_data(METADATA_FILE)
-    if base_date:
-        st.caption(f"📅 데이터 기준일: {base_date[:4]}-{base_date[4:6]}-{base_date[6:]}")
-    if warn_msg:
-        st.warning(warn_msg)
     result_df = run_grade_logic(master_df)
     result_df['recommend_label'] = result_df['recommend_grade'].map(GRADE_LABEL_MAP).fillna(result_df['recommend_grade'])
+    result_df['alert_label'] = result_df['alert_level'].map(ALERT_LABEL_MAP).fillna(result_df['alert_level'])
 
     st.sidebar.header("📂 메뉴")
     menu = st.sidebar.radio("이동하기", ["🏠 홈 (대시보드)", "📖 서비스 소개", "🔔 챗봇 구독하기"])
 
     if menu == "🏠 홈 (대시보드)":
+        if base_date:
+            st.caption(f"📅 데이터 기준일: {base_date[:4]}-{base_date[4:6]}-{base_date[6:]}")
+
         st.subheader("💡 오늘의 추천 카드")
 
         recommend_items = result_df[result_df['recommend_target'] != '']
@@ -250,11 +265,15 @@ def main():
             st.metric("💡 추천 대안 수", f"{rec_count}건")
 
         st.write("#### 📋 전체 품목 현황")
+        # [변경] 데이터 관련 안내는 표 바로 위, 작게만 표시
+        if warn_msg:
+            st.caption(warn_msg)
+
         display_cols = ['품목명', '조리 용도', '급등 원인 세부 유형', 'price_basis',
-                         'rate_1d', 'rate_1w', 'rate_1m', 'alert_level', 'recommend_label']
+                         'rate_1d', 'rate_1w', 'rate_1m', 'alert_label', 'recommend_label']
         display_cols = [c for c in display_cols if c in result_df.columns]
         st.dataframe(
-            result_df[display_cols].rename(columns={'recommend_label': 'recommend_grade'}),
+            result_df[display_cols].rename(columns={'alert_label': 'alert_level', 'recommend_label': 'recommend_grade'}),
             use_container_width=True
         )
 
@@ -305,10 +324,8 @@ def main():
         st.subheader("🗂️ 추천 카드는 이렇게 구성돼요")
         st.write("""
 가격 변동이 있는 품목이 많을 땐 전부 보여드리는 대신, **급등 품목을 먼저 채우고** 자리가 남으면 **1차 경고 품목 중 변동이 큰 순서대로** 채워서 최대 9개까지만 카드로 보여드려요.
-각 카드에는 급등 품목과 대체 품목의 등락률을 나란히 비교하는 그래프가 함께 떠서, 왜 그 품목을 추천했는지 한눈에 확인할 수 있어요.
-그 외 품목들은 아래 "전체 품목 현황" 표에서 확인할 수 있어요.
 
-"이유 보기" 버튼을 누르면 AI가 그 자리에서 바로 설명을 만들어드려요.
+카드의 "📊 그래프 보기"를 누르면 급등 품목과 대체 품목의 등락률을 나란히 비교하는 그래프가 뜨고, "💬 이유 보기"를 누르면 AI가 그 자리에서 바로 설명을 만들어드려요.
         """)
 
         st.subheader("📋 전체 품목 현황 표는 이렇게 읽어요")
@@ -352,7 +369,6 @@ def main():
             """)
 
         st.write("---")
-        # [수정] 기본값으로 개인 Chat ID가 노출되던 문제 해결 — 빈 칸으로 시작
         user_id = st.text_input(
             "본인의 텔레그램 Chat ID를 입력하세요",
             value="",
