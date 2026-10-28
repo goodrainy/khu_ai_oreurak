@@ -11,11 +11,11 @@ from llm_message import card_message
 # =========================================================
 st.set_page_config(page_title="오르락내리락", layout="wide")
 
-# 텔레그램 설정 (사용자 입력 필수)
 TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
 MY_CHAT_ID = st.secrets["MY_CHAT_ID"]
 SUBSCRIBERS_FILE = 'subscribers.json'
 METADATA_FILE = '품목58선_최종_통합본.xlsx'
+MAX_CARDS = 9  # 추천 카드 최대 표시 개수
 
 # =========================================================
 # [Part 2] 핵심 엔진 (알고리즘 및 통신)
@@ -42,7 +42,7 @@ def run_grade_logic(df, group_col='조리 용도', name_col='품목명',
     df['recommend_target'] = ''
     df['reason'] = ''
 
-    # 변동 점수: 1일 40% + 1개월 60% (설문 결과 반영한 급등/경고 판정에도 동일하게 사용)
+    # 변동 점수: 1일 40% + 1개월 60%
     df['score'] = (df['rate_1d'] * 0.4) + (df['rate_1m'] * 0.6)
 
     # [설문 기반 2단계 경고 기준] 1일+1개월이 섞인 score로 판정
@@ -56,7 +56,6 @@ def run_grade_logic(df, group_col='조리 용도', name_col='품목명',
     # 급등 + 1차 경고 둘 다 추천 대상에 포함
     target_idx = list(df[df['is_surge'] | df['is_warning']].index)
 
-    # 그래도 부족하면, 점수가 높은(많이 오르는) 품목으로 채움
     if len(target_idx) < fallback_top_n:
         others = df[(~df['is_surge']) & (~df['is_warning']) & (df['score'] > 0)]
         need = fallback_top_n - len(target_idx)
@@ -72,7 +71,6 @@ def run_grade_logic(df, group_col='조리 용도', name_col='품목명',
             tag = '상승 상위'
         target_group = row[group_col]
 
-        # 같은 조리 용도 안의 후보 (자기 자신 제외, 데이터 없는 품목 제외)
         candidates = df[(df[group_col] == target_group) & (df.index != idx)]
         if 'has_data' in candidates.columns:
             candidates = candidates[candidates['has_data']]
@@ -81,13 +79,17 @@ def run_grade_logic(df, group_col='조리 용도', name_col='품목명',
             grade, target = '3등급(최후)', '메뉴 변경 권장'
             reason = f"[{tag}] [{target_group}] 내 대체 품목 없음"
         else:
-            best = candidates.sort_values(by='score').iloc[0]
-            if best['score'] < surge_threshold * 0.5:
-                grade, target = '1등급(최선)', best[name_col]
-                reason = f"[{tag}] {best[name_col]}는 추세가 매우 안정적입니다."
+            # [변경] 대체재를 최대 2개까지 추천 (안정적인 순서대로)
+            best_candidates = candidates.sort_values(by='score').head(2)
+            target = ", ".join(best_candidates[name_col].tolist())
+            top_score = best_candidates.iloc[0]['score']
+
+            if top_score < surge_threshold * 0.5:
+                grade = '1등급(최선)'
+                reason = f"[{tag}] {target}는 추세가 비교적 안정적입니다."
             else:
-                grade, target = '2등급(차선)', best[name_col]
-                reason = f"[{tag}] {best[name_col]}도 상승 중이나 상대적으로 완만합니다."
+                grade = '2등급(차선)'
+                reason = f"[{tag}] {target}도 상승 중이나 상대적으로 완만합니다."
 
         df.at[idx, 'recommend_grade'] = grade
         df.at[idx, 'recommend_target'] = target
@@ -120,12 +122,57 @@ def subscribe_item(chat_id, item_name, alert_type):
 # [Part 3] Streamlit UI 구성
 # =========================================================
 
+def render_card(row, result_df):
+    """추천 카드 1장을 그려줌. AI 이유는 버튼을 눌렀을 때만 호출."""
+    with st.container(border=True):
+        if row['is_surge']:
+            alert_badge = "🔴 급등"
+        elif row['is_warning']:
+            alert_badge = "🟡 1차 경고"
+        else:
+            alert_badge = "📈 상승 상위"
+        st.markdown(f"##### {alert_badge} · {row['품목명']}")
+
+        targets = [t.strip() for t in str(row['recommend_target']).split(',') if t.strip()]
+        target_display = ", ".join(targets) if targets else row['recommend_target']
+
+        if row['recommend_grade'] == '1등급(최선)':
+            st.success(f"✅ 적극 추천: **{target_display}**")
+        elif row['recommend_grade'] == '2등급(차선)':
+            st.warning(f"🔄 참고 추천: **{target_display}**")
+        else:
+            st.error(f"🚫 대체 어려움 → {target_display}")
+
+        # [요구사항 7] 절감액 안내 (1순위 대체재 기준)
+        if targets:
+            item_price = row.get('current_price', 0) or 0
+            t_row = result_df[result_df['품목명'] == targets[0]]
+            if not t_row.empty and item_price > 0:
+                target_price = t_row.iloc[0].get('current_price', 0) or 0
+                if target_price > 0:
+                    diff = item_price - target_price
+                    if diff > 0:
+                        st.caption(f"💰 {targets[0]}로 바꾸면 약 {diff:,.0f}원 절감돼요")
+
+        # [요구사항 3] 이유는 버튼을 눌렀을 때만 ChatKHU 호출
+        reason_key = f"reason_{row['품목명']}"
+        if st.session_state.get(reason_key):
+            st.caption(f"이유: {st.session_state[reason_key]}")
+        else:
+            if st.button("💬 이유 보기", key=f"btn_{row['품목명']}"):
+                st.session_state[reason_key] = card_message(row, result_df)
+                st.rerun()
+
+        if targets:
+            basis = result_df.loc[result_df['품목명'] == targets[0], 'price_basis']
+            if not basis.empty and basis.iloc[0] == '중도매':
+                st.caption("*중도매가 기준이므로 소매가와 다를 수 있습니다*")
+
+
 def main():
-    # [이미지 유지] 상단 타이틀 섹션
     st.title("🍎 오르락내리락")
     st.caption("실시간 식재료 가격 변동 및 맞춤형 대체재 추천 서비스")
 
-    # 실시간 API + 58개 메타데이터 통합
     master_df, base_date, warn_msg = load_master_data(METADATA_FILE)
     if base_date:
         st.caption(f"📅 데이터 기준일: {base_date[:4]}-{base_date[4:6]}-{base_date[6:]}")
@@ -133,44 +180,48 @@ def main():
         st.warning(warn_msg)
     result_df = run_grade_logic(master_df)
 
-
-    # [요구사항 3] 사이드바 메뉴 순서: 홈 -> 서비스 소개 -> 챗봇 구독하기
     st.sidebar.header("📂 메뉴")
     menu = st.sidebar.radio("이동하기", ["🏠 홈 (대시보드)", "📖 서비스 소개", "🔔 챗봇 구독하기"])
 
     if menu == "🏠 홈 (대시보드)":
-        # [요구사항 5] 추천 카드를 최상단으로 배치
         st.subheader("💡 오늘의 추천 카드")
+
         recommend_items = result_df[result_df['recommend_target'] != '']
-        
-        if recommend_items.empty:
+        surge_pool = recommend_items[recommend_items['is_surge']].sort_values(by='score', ascending=False)
+        warning_pool = recommend_items[recommend_items['is_warning']].sort_values(by='score', ascending=False)
+
+        # [요구사항 1, 2] 급등 우선 채우고, 부족하면 경고에서 채움 (최대 9개)
+        show_surge = surge_pool.head(MAX_CARDS)
+        remain = MAX_CARDS - len(show_surge)
+        show_warning = warning_pool.head(remain) if remain > 0 else warning_pool.iloc[0:0]
+
+        total_count = len(recommend_items)
+        shown_count = len(show_surge) + len(show_warning)
+
+        if shown_count == 0:
             st.info("현재 추천할 수 있는 품목이 없습니다.")
         else:
-            cols = st.columns(3)
-            for idx, (_, row) in enumerate(recommend_items.iterrows()):
-                with cols[idx % 3]:
-                    with st.container(border=True):
-                        # [요구사항 4] 등급 안내
-                        if row['recommend_grade'] == '1등급(최선)':
-                            st.markdown("### ✅ 1등급 (최선)")
-                        elif row['recommend_grade'] == '2등급(차선)':
-                            st.markdown("### ⚠️ 2등급 (차선)")
-                        else:
-                            st.markdown("### 🚨 3등급 (최후)")
-                        st.write(f"**품목:** {row['품목명']}")
-                        st.write(f"**추천:** `{row['recommend_target']}`")
-                        st.caption(f"이유: {card_message(row, result_df)}")
-                        
-                        basis = result_df.loc[result_df['품목명'] == row['recommend_target'], 'price_basis']
-                        if not basis.empty and basis.iloc[0] == '중도매':
-                            st.caption("*중도매가 기준이므로 소매가와 다를 수 있습니다*")
+            if total_count > shown_count:
+                st.caption(f"⚠️ 현재 {total_count}개 품목에 변동이 있어요. 변동이 큰 상위 {shown_count}개만 보여드려요. (전체 목록은 아래 표에서 확인 가능)")
+
+            if not show_surge.empty:
+                st.markdown("#### 🔴 급등 품목")
+                cols = st.columns(3)
+                for idx, (_, row) in enumerate(show_surge.iterrows()):
+                    with cols[idx % 3]:
+                        render_card(row, result_df)
+
+            if not show_warning.empty:
+                st.markdown("#### 🟡 1차 경고 품목")
+                cols = st.columns(3)
+                for idx, (_, row) in enumerate(show_warning.iterrows()):
+                    with cols[idx % 3]:
+                        render_card(row, result_df)
 
         st.divider()
 
-        # [요구사항 5] 전체 품목 현황을 아래로 배치
         st.subheader("📊 실시간 급등 품목 및 전체 현황")
-        
-        # 메트릭 섹션 (급등 / 1차 경고 / 평균 등락률 / 추천 대안)
+
         m_col1, m_col2, m_col3, m_col4 = st.columns(4)
         with m_col1:
             spikes = int(result_df['is_surge'].sum())
@@ -186,7 +237,11 @@ def main():
             st.metric("💡 추천 대안 수", f"{rec_count}건")
 
         st.write("#### 📋 전체 품목 현황")
-        st.dataframe(result_df, use_container_width=True)
+        # [요구사항 4] 필요한 컬럼만 선택 (없는 컬럼은 자동으로 제외)
+        display_cols = ['품목명', '조리 용도', '급등 원인 세부 유형', 'price_basis',
+                         'rate_1d', 'rate_1w', 'rate_1m', 'alert_level', 'recommend_grade']
+        display_cols = [c for c in display_cols if c in result_df.columns]
+        st.dataframe(result_df[display_cols], use_container_width=True)
 
     elif menu == "📖 서비스 소개":
         st.subheader("💡 서비스 소개")
@@ -219,16 +274,35 @@ def main():
 
         st.divider()
         st.subheader("🥕 대체 식품은 어떻게 추천하나요?")
-        st.write("비슷한 용도로 사용할 수 있는 식품의 가격 흐름을 살펴보고, 선택할 수 있는 대안을 안내해 드려요.")
+        st.write("비슷한 용도로 사용할 수 있는 식품의 가격 흐름을 살펴보고, 선택할 수 있는 대안을 1~2가지 안내해 드려요.")
         st.info("""
-**🥇 1등급 · 가장 먼저 추천해요**
-같은 용도로 사용할 수 있는 식품 중 가격 흐름이 안정적인 품목이에요.
+**✅ 적극 추천**
+같은 용도로 사용할 수 있는 식품 중 가격 흐름이 안정적인 품목이에요. 바로 바꿔도 좋아요.
 
-**🥈 2등급 · 함께 고려해 보세요**
-가격이 오르고 있지만, 상대적으로 완만하게 오르는 품목이에요.
+**🔄 참고 추천**
+가격이 오르고 있지만, 상대적으로 완만하게 오르는 품목이에요. 그나마 나은 선택이에요.
 
-**🥉 3등급 · 메뉴를 바꿔보세요**
+**🚫 대체 어려움**
 같은 용도의 식품들이 모두 크게 올라 대체하기 어렵다면, 다른 메뉴를 선택하는 방법을 제안해요.
+        """)
+
+        st.divider()
+        st.subheader("🗂️ 추천 카드는 이렇게 구성돼요")
+        st.write("""
+가격 변동이 있는 품목이 많을 땐 전부 보여드리는 대신, **급등 품목을 먼저 채우고** 자리가 남으면 **1차 경고 품목 중 변동이 큰 순서대로** 채워서 최대 9개까지만 카드로 보여드려요.
+화면이 복잡해지지 않게 하기 위함이고, 그 외 품목들은 아래 "전체 품목 현황" 표에서 모두 확인할 수 있어요.
+
+카드의 "이유 보기" 버튼을 누르면 AI가 그 자리에서 바로 설명을 만들어드려요. (미리 만들어두지 않고 필요할 때만 생성해서 더 빠르게 화면을 볼 수 있어요)
+        """)
+
+        st.subheader("📋 전체 품목 현황 표는 이렇게 읽어요")
+        st.write("""
+- **품목명 / 조리 용도**: 어떤 식재료이고 어떤 용도로 분류되는지
+- **급등 원인 세부 유형**: 가격 변동의 성격(계절적 요인 등)
+- **price_basis**: 가격 기준이 소매인지 중도매인지
+- **rate_1d / rate_1w / rate_1m**: 1일·1주·1개월 전 대비 등락률(%)
+- **alert_level**: 정상 / 1차 경고 / 급등 (품목 자체의 상태)
+- **recommend_grade**: 적극 추천 / 참고 추천 / 대체 어려움에 해당하는 내부 등급
         """)
 
         st.caption("가격 정보와 추천 결과는 장보기를 돕기 위한 참고 자료예요. 실제 구매 가격은 판매처와 구매 시점에 따라 다를 수 있습니다.")
@@ -246,7 +320,6 @@ def main():
 비싸진 식재료 앞에서 고민하는 대신, 오르락내리락이 알려주는 다른 선택지도 함께 살펴보세요. 🥬
         """)
 
-        # [요구사항 1] 구독 가이드
         with st.expander("📢 구독은 이렇게 해요", expanded=True):
             st.markdown("""
 **① 텔레그램에서 봇을 시작해 주세요.**
@@ -261,18 +334,17 @@ def main():
 **④ [구독 신청하기]를 누르면 끝!**
 이제 관심 품목의 소식을 텔레그램에서 편하게 확인해 보세요.
             """)
-        
+
         st.write("---")
         user_id = st.text_input("본인의 텔레그램 Chat ID를 입력하세요", value=MY_CHAT_ID)
         selected_items = st.multiselect("알림을 받고 싶은 품목을 선택하세요", sorted(master_df['품목명'].unique()))
-        
-        # [요구사항 2] 알림 조건 선택
+
         alert_option = st.radio(
             "어떤 상황에서 알림을 받을까요?",
             ["🚨 품목 가격이 급등할 때만", "💡 추천 제품이 떴을 때도 포함"],
             index=0
         )
-        
+
         option_map = {
             "🚨 품목 가격이 급등할 때만": "급등 시",
             "💡 추천 제품이 떴을 때도 포함": "추천 포함"

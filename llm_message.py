@@ -5,6 +5,7 @@
 #   - 화면에 등급 아이콘이 이미 표시되므로, AI 문장에는 등급/태그를 반복하지 않음
 #   - AI 실패/지연/엉뚱한 답이면 → 조사 보정한 기본 문장으로 대체 (서비스 안 멈춤)
 #   - 같은 내용은 하루 동안 캐시해서 호출 횟수(크레딧) 절약
+#   - app.py에서 "이유 보기" 버튼을 눌렀을 때만 호출됨 (즉시 호출 안 함)
 # =========================================================
 import re
 import requests
@@ -21,8 +22,7 @@ def _core(word):
 
 
 def josa(word, with_batchim, without_batchim):
-    """받침 있으면 with_batchim, 없으면 without_batchim 조사를 붙여 반환
-    예) josa('깻잎','은','는') → '깻잎은',  josa('상추','은','는') → '상추는'"""
+    """받침 있으면 with_batchim, 없으면 without_batchim 조사를 붙여 반환"""
     word = str(word).strip()
     base = _core(word)
     if not base:
@@ -34,14 +34,24 @@ def josa(word, with_batchim, without_batchim):
     return word + without_batchim
 
 
+def _target_list(target):
+    """recommend_target('깻잎, 치커리' 또는 '깻잎')을 리스트로 변환"""
+    if isinstance(target, (list, tuple)):
+        return list(target)
+    return [t.strip() for t in str(target).split(',') if t.strip()]
+
+
 # ---------- 2. 기본 문장 (AI 실패 시 사용) ----------
 def fallback_text(item, grade, target, tag):
-    """AI 없이 만드는 기본 문장. 조사 보정 적용. (태그/등급 단어 없이 자연스럽게)"""
+    """AI 없이 만드는 기본 문장. 대체재가 1~2개인 경우 모두 처리."""
+    targets = _target_list(target)
+    target_str = ", ".join(targets) if targets else str(target)
+
     if grade.startswith("3등급"):
         return f"{josa(item, '이', '가')} 올랐는데, 같은 용도로 쓸 대체 품목이 없어요. 오늘은 다른 메뉴를 고려해 보세요."
     if grade.startswith("1등급"):
-        return f"{josa(item, '이', '가')} 올랐어요. 대신 {josa(target, '은', '는')} 가격 흐름이 안정적이에요."
-    return f"{josa(item, '이', '가')} 올랐어요. 대신 {josa(target, '도', '도')} 오르는 중이지만 상대적으로 완만해요."
+        return f"{josa(item, '이', '가')} 올랐어요. 대신 {target_str}의 가격 흐름이 비교적 안정적이에요."
+    return f"{josa(item, '이', '가')} 올랐어요. 대신 {target_str}도 오르는 중이지만 상대적으로 완만해요."
 
 
 # ---------- 3. AI 호출 ----------
@@ -66,6 +76,7 @@ def _ask_llm(facts_text):
         "'최선', '차선', '급등', '상승 상위' 같은 표현은 절대 쓰지 마. "
         "아래 [사실]에 있는 내용만 사용해서 한국어 해요체로 1~2문장을 써. "
         "가격이 얼마나 올랐는지와 대체재가 왜 더 나은 선택인지를 자연스럽게 설명해. "
+        "대체 품목이 여러 개면 자연스럽게 함께 언급해. "
         "숫자·품목명을 바꾸거나 새로운 정보(원인, 조리법 등)를 추가하지 마. "
         "조사(은/는, 이/가, 을/를)는 받침에 맞게 정확히 써. "
         "이모지, 마크다운, 대괄호 태그는 쓰지 마."
@@ -92,40 +103,41 @@ def _ask_llm(facts_text):
     return text.strip()
 
 
-# ---------- 4. 최종 문구 만들기 (app.py에서 이 함수를 호출) ----------
+# ---------- 4. 최종 문구 만들기 (app.py의 "이유 보기" 버튼이 이 함수를 호출) ----------
 def card_message(row, df, name_col="품목명"):
     """추천 카드 1장의 '이유' 문장을 반환. row = result_df의 한 행"""
     item = row[name_col]
     grade = row["recommend_grade"]
     target = row["recommend_target"]
-    tag = "급등" if row.get("is_surge", False) else "상승 상위"
+    tag = "급등" if row.get("is_surge", False) else ("1차 경고" if row.get("is_warning", False) else "상승 상위")
     base = fallback_text(item, grade, target, tag)
 
-    # AI 키가 없으면 기본 문장
     if not _get_secret("KHU_LLM_KEY"):
         return base
 
-    # AI에게 줄 '사실' 정리 (등급 정보는 빼고, 수치 중심으로만 전달)
+    targets = _target_list(target)
     facts = [
         f"품목: {item} (1일 {row['rate_1d']:.1f}%, 1개월 {row['rate_1m']:.1f}% 상승)",
     ]
     if grade.startswith("3등급"):
         facts.append("같은 용도로 쓸 대체 품목이 없어서 다른 메뉴로 바꾸는 걸 권장함")
     else:
-        t = df[df[name_col] == target]
-        if not t.empty:
-            t = t.iloc[0]
-            facts.append(f"대체 품목: {target} (1일 {t['rate_1d']:.1f}%, 1개월 {t['rate_1m']:.1f}%)")
-        else:
-            facts.append(f"대체 품목: {target}")
+        sub_facts = []
+        for t in targets:
+            trow = df[df[name_col] == t]
+            if not trow.empty:
+                tr = trow.iloc[0]
+                sub_facts.append(f"{t} (1일 {tr['rate_1d']:.1f}%, 1개월 {tr['rate_1m']:.1f}%)")
+            else:
+                sub_facts.append(t)
+        facts.append("대체 품목 후보: " + "; ".join(sub_facts))
     facts_text = "[사실]\n" + "\n".join(facts)
 
     try:
         text = _ask_llm(facts_text)
-        # 안전장치: 품목명이 빠졌거나 너무 길면 AI 답을 버리고 기본 문장 사용
-        if _core(item) not in text or len(text) > 200:
+        if _core(item) not in text or len(text) > 220:
             return base
-        return text  # 대괄호 태그 제거 — 더 자연스럽게
+        return text
     except Exception as e:
         print(f"[LLM 실패 → 기본 문장 사용] {e}")
         return base
