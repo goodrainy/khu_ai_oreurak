@@ -34,7 +34,7 @@ def send_telegram_message(token, chat_id, message):
         print(f"🚨 전송 중 에러: {e}")
 
 def run_grade_logic(df, group_col='조리 용도', name_col='품목명',
-                    threshold_1d=5.0, threshold_1m=5.0, fallback_top_n=5):
+                    warning_threshold=10.0, surge_threshold=20.0, fallback_top_n=5):
     df = df.copy()
     df[group_col] = df[group_col].astype(str).str.strip()
     df[name_col] = df[name_col].astype(str).str.strip()
@@ -42,24 +42,34 @@ def run_grade_logic(df, group_col='조리 용도', name_col='품목명',
     df['recommend_target'] = ''
     df['reason'] = ''
 
-    # 변동 점수: 1일 40% + 1개월 60% (설문 결과 나오면 조정)
+    # 변동 점수: 1일 40% + 1개월 60% (설문 결과 반영한 급등/경고 판정에도 동일하게 사용)
     df['score'] = (df['rate_1d'] * 0.4) + (df['rate_1m'] * 0.6)
 
-    # 급등 여부 (기존 기준 그대로)
-    df['is_surge'] = (df['rate_1d'] >= threshold_1d) & (df['rate_1m'] >= threshold_1m)
+    # [설문 기반 2단계 경고 기준] 1일+1개월이 섞인 score로 판정
+    # 총 89명 설문 결과, 38.2%가 10~20% 상승 구간을 체감 기준으로 선택 → 10%를 1차 경고, 20%를 급등 기준으로 설정
+    df['is_surge'] = df['score'] >= surge_threshold
+    df['is_warning'] = (df['score'] >= warning_threshold) & (df['score'] < surge_threshold)
+    df['alert_level'] = '정상'
+    df.loc[df['is_warning'], 'alert_level'] = '1차 경고'
+    df.loc[df['is_surge'], 'alert_level'] = '급등'
 
-    # 추천 대상 1순위: 급등 품목
-    target_idx = list(df[df['is_surge']].index)
+    # 급등 + 1차 경고 둘 다 추천 대상에 포함
+    target_idx = list(df[df['is_surge'] | df['is_warning']].index)
 
-    # 급등이 부족하면, 점수가 높은(많이 오르는) 품목으로 채움
+    # 그래도 부족하면, 점수가 높은(많이 오르는) 품목으로 채움
     if len(target_idx) < fallback_top_n:
-        others = df[(~df['is_surge']) & (df['score'] > 0)]
+        others = df[(~df['is_surge']) & (~df['is_warning']) & (df['score'] > 0)]
         need = fallback_top_n - len(target_idx)
         target_idx += list(others.nlargest(need, 'score').index)
 
     for idx in target_idx:
         row = df.loc[idx]
-        tag = '급등' if row['is_surge'] else '상승 상위'
+        if row['is_surge']:
+            tag = '급등'
+        elif row['is_warning']:
+            tag = '1차 경고'
+        else:
+            tag = '상승 상위'
         target_group = row[group_col]
 
         # 같은 조리 용도 안의 후보 (자기 자신 제외, 데이터 없는 품목 제외)
@@ -72,7 +82,7 @@ def run_grade_logic(df, group_col='조리 용도', name_col='품목명',
             reason = f"[{tag}] [{target_group}] 내 대체 품목 없음"
         else:
             best = candidates.sort_values(by='score').iloc[0]
-            if best['score'] < threshold_1d * 0.5:
+            if best['score'] < surge_threshold * 0.5:
                 grade, target = '1등급(최선)', best[name_col]
                 reason = f"[{tag}] {best[name_col]}는 추세가 매우 안정적입니다."
             else:
@@ -160,15 +170,18 @@ def main():
         # [요구사항 5] 전체 품목 현황을 아래로 배치
         st.subheader("📊 실시간 급등 품목 및 전체 현황")
         
-        # 메트릭 섹션
-        m_col1, m_col2, m_col3 = st.columns(3)
+        # 메트릭 섹션 (급등 / 1차 경고 / 평균 등락률 / 추천 대안)
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
         with m_col1:
             spikes = int(result_df['is_surge'].sum())
-            st.metric("🚨 현재 급등 품목", f"{spikes}개")
+            st.metric("🔴 급등 품목", f"{spikes}개")
         with m_col2:
-            avg_rate = result_df['rate_1d'].mean()
-            st.metric("📈 평균 등락률(1d)", f"{avg_rate:.1f}%")
+            warnings = int(result_df['is_warning'].sum())
+            st.metric("🟡 1차 경고 품목", f"{warnings}개")
         with m_col3:
+            avg_rate = result_df['rate_1m'].mean()
+            st.metric("📈 평균 등락률(1개월)", f"{avg_rate:.1f}%")
+        with m_col4:
             rec_count = len(result_df[result_df['recommend_target'] != ''])
             st.metric("💡 추천 대안 수", f"{rec_count}건")
 
@@ -177,31 +190,76 @@ def main():
 
     elif menu == "📖 서비스 소개":
         st.subheader("💡 서비스 소개")
-        st.write("오르락내리락은 AI를 통해 식재료 가격 변동을 감지하고 최적의 대체재를 추천합니다.")
-        
-        st.divider()
-        # [요구사항 3] 선정 기준 포함
-        st.subheader("⚖️ AI 선정 기준 안내")
-        st.info("""
-        **1. 가격 급등 판단 기준**
-        - 1일 등락률 5% 이상 & 1개월 등락률 5% 이상 동시 충족 시
-        
-        **2. 추천 등급 안내**
-        - **🥇 1등급 (최선):** 동일 용도 내에서 가격 추세가 매우 안정적인 품목
-        - **🥈 2등급 (차선):** 동일 용도 내에서 가격이 오르고 있으나 상대적으로 완만한 품목
-        - **🥉 3등급 (최후):** 해당 용도 전체가 급등하여 대체재가 없는 경우 $\rightarrow$ 메뉴 변경 권장
+        st.markdown("""
+#### 가격은 오르락내리락, 장보기 고민은 가볍게!
+
+"늘 사던 식재료인데, 어느새 가격이 이렇게 올랐네?"
+
+장을 보다 보면 예상보다 비싸진 가격에 장바구니에 담기를 망설일 때가 있어요. 그렇다고 다른 재료의 가격을 일일이 비교하기도 쉽지 않죠.
+
+**오르락내리락**은 식재료 가격 변화를 살펴보고, 가격이 크게 올랐을 때 대체 식품을 찾아주는 서비스예요.
+
+가격이 조금씩 오르기 시작하면 미리 확인할 수 있도록 알려드리고, 많이 오른 경우에는 비슷한 용도로 사용할 수 있는 다른 식품을 추천해요. 대체하기 적절한 식품을 찾기 어려울 때는 메뉴를 바꿔보는 방법도 제안합니다.
+
+오늘은 무엇을 장바구니에 담을지 고민될 때, 오르락내리락과 함께 더 알뜰한 선택을 해보세요. 🛒
         """)
+
+        st.divider()
+        st.subheader("📈 가격 변화는 이렇게 알려드려요")
+        st.warning("""
+**🟡 1차 경고 · 가격 상승률 10% 이상 ~ 20% 미만**
+
+가격이 오르고 있어요. 구매하기 전에 가격 변화를 한 번 살펴보세요.
+        """)
+        st.error("""
+**🔴 가격 급등 · 가격 상승률 20% 이상**
+
+가격이 크게 올랐어요. 비슷한 용도로 활용할 수 있는 대체 식품을 확인해 보세요.
+        """)
+
+        st.divider()
+        st.subheader("🥕 대체 식품은 어떻게 추천하나요?")
+        st.write("비슷한 용도로 사용할 수 있는 식품의 가격 흐름을 살펴보고, 선택할 수 있는 대안을 안내해 드려요.")
+        st.info("""
+**🥇 1등급 · 가장 먼저 추천해요**
+같은 용도로 사용할 수 있는 식품 중 가격 흐름이 안정적인 품목이에요.
+
+**🥈 2등급 · 함께 고려해 보세요**
+가격이 오르고 있지만, 상대적으로 완만하게 오르는 품목이에요.
+
+**🥉 3등급 · 메뉴를 바꿔보세요**
+같은 용도의 식품들이 모두 크게 올라 대체하기 어렵다면, 다른 메뉴를 선택하는 방법을 제안해요.
+        """)
+
+        st.caption("가격 정보와 추천 결과는 장보기를 돕기 위한 참고 자료예요. 실제 구매 가격은 판매처와 구매 시점에 따라 다를 수 있습니다.")
 
     elif menu == "🔔 챗봇 구독하기":
         st.subheader("📱 실시간 알림 구독 설정")
-        
+
+        st.markdown("""
+#### 내 장바구니에 필요한 소식만 쏙!
+
+자주 사는 식재료 가격이 궁금하지만, 매번 직접 확인하기 번거로우셨나요?
+
+오르락내리락 챗봇을 구독하고 관심 있는 품목을 선택해 보세요. 설정한 조건에 따라 가격이 급등하거나 추천 정보가 나왔을 때 텔레그램으로 소식을 받아볼 수 있어요.
+
+비싸진 식재료 앞에서 고민하는 대신, 오르락내리락이 알려주는 다른 선택지도 함께 살펴보세요. 🥬
+        """)
+
         # [요구사항 1] 구독 가이드
-        with st.expander("📢 구독 방법 안내", expanded=True):
+        with st.expander("📢 구독은 이렇게 해요", expanded=True):
             st.markdown("""
-            **알림을 받으려면 다음 단계를 따라주세요!**
-            1. 텔레그램 앱을 설치하고 **[@오르락내리락_봇]** 을 검색해 **[시작]** 을 누릅니다.
-            2. 아래 목록에서 관심 품목을 선택합니다.
-            3. **알림 조건**을 선택하고 **[구독 신청하기]** 를 누르면 끝!
+**① 텔레그램에서 봇을 시작해 주세요.**
+텔레그램 앱에서 안내된 오르락내리락 봇을 찾고 [시작]을 눌러주세요.
+
+**② Chat ID를 입력해 주세요.**
+알림을 받을 텔레그램 Chat ID를 입력해 주세요.
+
+**③ 관심 품목과 알림 조건을 선택해 주세요.**
+가격이 궁금한 식재료를 고르고, 원하는 알림 조건을 선택해 주세요.
+
+**④ [구독 신청하기]를 누르면 끝!**
+이제 관심 품목의 소식을 텔레그램에서 편하게 확인해 보세요.
             """)
         
         st.write("---")
