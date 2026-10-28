@@ -17,6 +17,13 @@ SUBSCRIBERS_FILE = 'subscribers.json'
 METADATA_FILE = '품목58선_최종_통합본.xlsx'
 MAX_CARDS = 9  # 추천 카드 최대 표시 개수
 
+GRADE_LABEL_MAP = {
+    '1등급(최선)': '✅ 적극 추천',
+    '2등급(차선)': '🔄 참고 추천',
+    '3등급(최후)': '🚫 대체 어려움',
+    '정상': '-',
+}
+
 # =========================================================
 # [Part 2] 핵심 엔진 (알고리즘 및 통신)
 # =========================================================
@@ -42,18 +49,14 @@ def run_grade_logic(df, group_col='조리 용도', name_col='품목명',
     df['recommend_target'] = ''
     df['reason'] = ''
 
-    # 변동 점수: 1일 40% + 1개월 60%
     df['score'] = (df['rate_1d'] * 0.4) + (df['rate_1m'] * 0.6)
 
-    # [설문 기반 2단계 경고 기준] 1일+1개월이 섞인 score로 판정
-    # 총 89명 설문 결과, 38.2%가 10~20% 상승 구간을 체감 기준으로 선택 → 10%를 1차 경고, 20%를 급등 기준으로 설정
     df['is_surge'] = df['score'] >= surge_threshold
     df['is_warning'] = (df['score'] >= warning_threshold) & (df['score'] < surge_threshold)
     df['alert_level'] = '정상'
     df.loc[df['is_warning'], 'alert_level'] = '1차 경고'
     df.loc[df['is_surge'], 'alert_level'] = '급등'
 
-    # 급등 + 1차 경고 둘 다 추천 대상에 포함
     target_idx = list(df[df['is_surge'] | df['is_warning']].index)
 
     if len(target_idx) < fallback_top_n:
@@ -79,7 +82,6 @@ def run_grade_logic(df, group_col='조리 용도', name_col='품목명',
             grade, target = '3등급(최후)', '메뉴 변경 권장'
             reason = f"[{tag}] [{target_group}] 내 대체 품목 없음"
         else:
-            # [변경] 대체재를 최대 2개까지 추천 (안정적인 순서대로)
             best_candidates = candidates.sort_values(by='score').head(2)
             target = ", ".join(best_candidates[name_col].tolist())
             top_score = best_candidates.iloc[0]['score']
@@ -123,7 +125,7 @@ def subscribe_item(chat_id, item_name, alert_type):
 # =========================================================
 
 def render_card(row, result_df):
-    """추천 카드 1장을 그려줌. AI 이유는 버튼을 눌렀을 때만 호출."""
+    """추천 카드 1장을 그려줌. 등락률 비교 차트는 즉시, AI 이유는 버튼 눌렀을 때만."""
     with st.container(border=True):
         if row['is_surge']:
             alert_badge = "🔴 급등"
@@ -143,7 +145,18 @@ def render_card(row, result_df):
         else:
             st.error(f"🚫 대체 어려움 → {target_display}")
 
-        # [요구사항 7] 절감액 안내 (1순위 대체재 기준)
+        # [Explainable AI] 등락률 비교 차트 — 급등 품목 vs 대체재
+        if targets:
+            chart_df = pd.DataFrame(index=['1일 등락률(%)', '1개월 등락률(%)'])
+            chart_df[row['품목명']] = [row['rate_1d'], row['rate_1m']]
+            for t in targets:
+                t_row = result_df[result_df['품목명'] == t]
+                if not t_row.empty:
+                    tr = t_row.iloc[0]
+                    chart_df[t] = [tr['rate_1d'], tr['rate_1m']]
+            st.bar_chart(chart_df)
+
+        # 절감액 안내 (1순위 대체재 기준)
         if targets:
             item_price = row.get('current_price', 0) or 0
             t_row = result_df[result_df['품목명'] == targets[0]]
@@ -154,7 +167,7 @@ def render_card(row, result_df):
                     if diff > 0:
                         st.caption(f"💰 {targets[0]}로 바꾸면 약 {diff:,.0f}원 절감돼요")
 
-        # [요구사항 3] 이유는 버튼을 눌렀을 때만 ChatKHU 호출
+        # 이유는 버튼을 눌렀을 때만 ChatKHU 호출
         reason_key = f"reason_{row['품목명']}"
         if st.session_state.get(reason_key):
             st.caption(f"이유: {st.session_state[reason_key]}")
@@ -179,6 +192,7 @@ def main():
     if warn_msg:
         st.warning(warn_msg)
     result_df = run_grade_logic(master_df)
+    result_df['recommend_label'] = result_df['recommend_grade'].map(GRADE_LABEL_MAP).fillna(result_df['recommend_grade'])
 
     st.sidebar.header("📂 메뉴")
     menu = st.sidebar.radio("이동하기", ["🏠 홈 (대시보드)", "📖 서비스 소개", "🔔 챗봇 구독하기"])
@@ -190,7 +204,6 @@ def main():
         surge_pool = recommend_items[recommend_items['is_surge']].sort_values(by='score', ascending=False)
         warning_pool = recommend_items[recommend_items['is_warning']].sort_values(by='score', ascending=False)
 
-        # [요구사항 1, 2] 급등 우선 채우고, 부족하면 경고에서 채움 (최대 9개)
         show_surge = surge_pool.head(MAX_CARDS)
         remain = MAX_CARDS - len(show_surge)
         show_warning = warning_pool.head(remain) if remain > 0 else warning_pool.iloc[0:0]
@@ -237,11 +250,13 @@ def main():
             st.metric("💡 추천 대안 수", f"{rec_count}건")
 
         st.write("#### 📋 전체 품목 현황")
-        # [요구사항 4] 필요한 컬럼만 선택 (없는 컬럼은 자동으로 제외)
         display_cols = ['품목명', '조리 용도', '급등 원인 세부 유형', 'price_basis',
-                         'rate_1d', 'rate_1w', 'rate_1m', 'alert_level', 'recommend_grade']
+                         'rate_1d', 'rate_1w', 'rate_1m', 'alert_level', 'recommend_label']
         display_cols = [c for c in display_cols if c in result_df.columns]
-        st.dataframe(result_df[display_cols], use_container_width=True)
+        st.dataframe(
+            result_df[display_cols].rename(columns={'recommend_label': 'recommend_grade'}),
+            use_container_width=True
+        )
 
     elif menu == "📖 서비스 소개":
         st.subheader("💡 서비스 소개")
@@ -290,9 +305,10 @@ def main():
         st.subheader("🗂️ 추천 카드는 이렇게 구성돼요")
         st.write("""
 가격 변동이 있는 품목이 많을 땐 전부 보여드리는 대신, **급등 품목을 먼저 채우고** 자리가 남으면 **1차 경고 품목 중 변동이 큰 순서대로** 채워서 최대 9개까지만 카드로 보여드려요.
-화면이 복잡해지지 않게 하기 위함이고, 그 외 품목들은 아래 "전체 품목 현황" 표에서 모두 확인할 수 있어요.
+각 카드에는 급등 품목과 대체 품목의 등락률을 나란히 비교하는 그래프가 함께 떠서, 왜 그 품목을 추천했는지 한눈에 확인할 수 있어요.
+그 외 품목들은 아래 "전체 품목 현황" 표에서 확인할 수 있어요.
 
-카드의 "이유 보기" 버튼을 누르면 AI가 그 자리에서 바로 설명을 만들어드려요. (미리 만들어두지 않고 필요할 때만 생성해서 더 빠르게 화면을 볼 수 있어요)
+"이유 보기" 버튼을 누르면 AI가 그 자리에서 바로 설명을 만들어드려요.
         """)
 
         st.subheader("📋 전체 품목 현황 표는 이렇게 읽어요")
@@ -302,7 +318,7 @@ def main():
 - **price_basis**: 가격 기준이 소매인지 중도매인지
 - **rate_1d / rate_1w / rate_1m**: 1일·1주·1개월 전 대비 등락률(%)
 - **alert_level**: 정상 / 1차 경고 / 급등 (품목 자체의 상태)
-- **recommend_grade**: 적극 추천 / 참고 추천 / 대체 어려움에 해당하는 내부 등급
+- **recommend_grade**: 적극 추천 / 참고 추천 / 대체 어려움 (추천 품질)
         """)
 
         st.caption("가격 정보와 추천 결과는 장보기를 돕기 위한 참고 자료예요. 실제 구매 가격은 판매처와 구매 시점에 따라 다를 수 있습니다.")
@@ -336,7 +352,12 @@ def main():
             """)
 
         st.write("---")
-        user_id = st.text_input("본인의 텔레그램 Chat ID를 입력하세요", value=MY_CHAT_ID)
+        # [수정] 기본값으로 개인 Chat ID가 노출되던 문제 해결 — 빈 칸으로 시작
+        user_id = st.text_input(
+            "본인의 텔레그램 Chat ID를 입력하세요",
+            value="",
+            placeholder="예: 123456789"
+        )
         selected_items = st.multiselect("알림을 받고 싶은 품목을 선택하세요", sorted(master_df['품목명'].unique()))
 
         alert_option = st.radio(
@@ -351,7 +372,9 @@ def main():
         }
 
         if st.button("구독 신청하기"):
-            if selected_items:
+            if not user_id.strip():
+                st.warning("Chat ID를 입력해주세요.")
+            elif selected_items:
                 for item in selected_items:
                     subscribe_item(user_id, item, option_map[alert_option])
                 st.success(f"{len(selected_items)}개 품목 구독이 완료되었습니다!")
