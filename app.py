@@ -34,16 +34,17 @@ ALERT_LABEL_MAP = {
 # =========================================================
 
 def send_telegram_message(token, chat_id, message):
+    """전송 성공 여부(True/False)와 상세 메시지를 반환"""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {'chat_id': str(chat_id), 'text': message, 'parse_mode': 'HTML'}
     try:
-        response = requests.post(url, data=payload)
+        response = requests.post(url, data=payload, timeout=10)
         if response.status_code == 200:
-            print("✅ 텔레그램 메시지 전송 성공!")
+            return True, "전송 성공"
         else:
-            print(f"❌ 전송 실패: {response.status_code} - {response.text}")
+            return False, f"{response.status_code} - {response.text}"
     except Exception as e:
-        print(f"🚨 전송 중 에러: {e}")
+        return False, f"요청 중 오류: {e}"
 
 def run_grade_logic(df, group_col='조리 용도', name_col='품목명',
                     warning_threshold=10.0, surge_threshold=20.0, fallback_top_n=5):
@@ -125,12 +126,49 @@ def subscribe_item(chat_id, item_name, alert_type):
         print(f"Subscription Error: {e}")
         return False
 
+def send_daily_alerts(result_df):
+    """구독자 목록을 돌면서 조건에 맞으면 텔레그램 발송. 관리자 테스트 버튼에서 호출."""
+    results = []
+    if not os.path.exists(SUBSCRIBERS_FILE):
+        return results
+    with open(SUBSCRIBERS_FILE, 'r') as f:
+        subscribers = json.load(f)
+
+    for sub in subscribers:
+        item = sub.get('item')
+        chat_id = sub.get('chat_id')
+        alert_type = sub.get('alert_type')
+
+        row_match = result_df[result_df['품목명'] == item]
+        if row_match.empty:
+            continue
+        row = row_match.iloc[0]
+
+        should_send = False
+        if alert_type == '급등 시' and row['is_surge']:
+            should_send = True
+        elif alert_type == '추천 포함' and (row['is_surge'] or row['is_warning']):
+            should_send = True
+
+        if not should_send:
+            continue
+
+        msg = (f"🔔 <b>[오르락내리락] {item} 알림</b>\n\n"
+               f"현재 상태: {row['alert_level']}\n"
+               f"1개월 등락률: {row['rate_1m']:.1f}%\n")
+        if row['recommend_target']:
+            msg += f"추천 대체재: {row['recommend_target']}\n"
+
+        ok, detail = send_telegram_message(TELEGRAM_TOKEN, chat_id, msg)
+        results.append({'item': item, 'ok': ok, 'detail': detail})
+
+    return results
+
 # =========================================================
 # [Part 3] Streamlit UI 구성
 # =========================================================
 
 def render_card(row, result_df):
-    """추천 카드 1장을 그려줌. 이유/그래프는 버튼을 눌렀을 때만 펼쳐짐."""
     item_name = row['품목명']
     with st.container(border=True):
         if row['is_surge']:
@@ -151,7 +189,6 @@ def render_card(row, result_df):
         else:
             st.error(f"🚫 대체 어려움 → {target_display}")
 
-        # 절감액 안내 (1순위 대체재 기준)
         if targets:
             item_price = row.get('current_price', 0) or 0
             t_row = result_df[result_df['품목명'] == targets[0]]
@@ -162,7 +199,6 @@ def render_card(row, result_df):
                     if diff > 0:
                         st.caption(f"💰 {targets[0]}로 바꾸면 약 {diff:,.0f}원 절감돼요")
 
-        # [변경] 이유 보기 / 그래프 보기 버튼을 나란히 배치
         reason_key = f"reason_{item_name}"
         chart_key = f"chart_{item_name}"
         btn_col1, btn_col2 = st.columns(2)
@@ -180,7 +216,7 @@ def render_card(row, result_df):
         if st.session_state.get(reason_key):
             st.caption(f"이유: {st.session_state[reason_key]}")
 
-        # [변경] 막대그래프 → 선그래프 (우상향 흐름이 잘 보이게)
+        # [변경] 다시 막대그래프로
         if targets and st.session_state.get(chart_key):
             chart_df = pd.DataFrame(index=['1일 등락률(%)', '1개월 등락률(%)'])
             chart_df[item_name] = [row['rate_1d'], row['rate_1m']]
@@ -189,7 +225,7 @@ def render_card(row, result_df):
                 if not t_row.empty:
                     tr = t_row.iloc[0]
                     chart_df[t] = [tr['rate_1d'], tr['rate_1m']]
-            st.line_chart(chart_df)
+            st.bar_chart(chart_df)
 
         if targets:
             basis = result_df.loc[result_df['품목명'] == targets[0], 'price_basis']
@@ -202,12 +238,26 @@ def main():
     st.caption("실시간 식재료 가격 변동 및 맞춤형 대체재 추천 서비스")
 
     master_df, base_date, warn_msg = load_master_data(METADATA_FILE)
+    master_df['품목명'] = master_df['품목명'].astype(str).str.strip()
     result_df = run_grade_logic(master_df)
     result_df['recommend_label'] = result_df['recommend_grade'].map(GRADE_LABEL_MAP).fillna(result_df['recommend_grade'])
     result_df['alert_label'] = result_df['alert_level'].map(ALERT_LABEL_MAP).fillna(result_df['alert_level'])
 
     st.sidebar.header("📂 메뉴")
     menu = st.sidebar.radio("이동하기", ["🏠 홈 (대시보드)", "📖 서비스 소개", "🔔 챗봇 구독하기"])
+
+    # [재추가] 관리자 테스트 패널
+    with st.sidebar.expander("🛠️ 관리자 테스트"):
+        if st.button("지금 바로 데일리 알림 테스트"):
+            test_results = send_daily_alerts(result_df)
+            if not test_results:
+                st.info("조건에 맞는 구독/알림 대상이 없습니다.")
+            else:
+                for r in test_results:
+                    if r['ok']:
+                        st.success(f"[{r['item']}] 발송 성공")
+                    else:
+                        st.error(f"[{r['item']}] 발송 실패 - {r['detail']}")
 
     if menu == "🏠 홈 (대시보드)":
         if base_date:
@@ -265,7 +315,6 @@ def main():
             st.metric("💡 추천 대안 수", f"{rec_count}건")
 
         st.write("#### 📋 전체 품목 현황")
-        # [변경] 데이터 관련 안내는 표 바로 위, 작게만 표시
         if warn_msg:
             st.caption(warn_msg)
 
@@ -325,7 +374,7 @@ def main():
         st.write("""
 가격 변동이 있는 품목이 많을 땐 전부 보여드리는 대신, **급등 품목을 먼저 채우고** 자리가 남으면 **1차 경고 품목 중 변동이 큰 순서대로** 채워서 최대 9개까지만 카드로 보여드려요.
 
-카드의 "📊 그래프 보기"를 누르면 급등 품목과 대체 품목의 등락률을 나란히 비교하는 그래프가 뜨고, "💬 이유 보기"를 누르면 AI가 그 자리에서 바로 설명을 만들어드려요.
+카드의 "📊 그래프 보기"를 누르면 급등 품목과 대체 품목의 등락률을 나란히 비교하는 그래프가 뜨고, "💬 이유 보기"를 누르면 AI가 그 자리에서 바로 설명을 만들어드려요. 둘 다 필요할 때만 눌러서 보는 방식이라 화면이 깔끔하고 더 빨라요.
         """)
 
         st.subheader("📋 전체 품목 현황 표는 이렇게 읽어요")
@@ -374,7 +423,11 @@ def main():
             value="",
             placeholder="예: 123456789"
         )
-        selected_items = st.multiselect("알림을 받고 싶은 품목을 선택하세요", sorted(master_df['품목명'].unique()))
+
+        item_options = sorted(master_df['품목명'].unique())
+        selected_items = st.multiselect("알림을 받고 싶은 품목을 선택하세요", item_options)
+        # [확인용] 실제로 몇 개 품목이 선택 가능한지 바로 보이게
+        st.caption(f"총 {len(item_options)}개 품목 중에서 선택할 수 있어요.")
 
         alert_option = st.radio(
             "어떤 상황에서 알림을 받을까요?",
