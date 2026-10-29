@@ -16,6 +16,7 @@ MY_CHAT_ID = st.secrets["MY_CHAT_ID"]
 SUBSCRIBERS_FILE = 'subscribers.json'
 METADATA_FILE = '품목58선_최종_통합본.xlsx'
 MAX_CARDS = 9
+APP_URL = "https://khuaioreurak-jyje7pzwepyquuajjurvvn.streamlit.app/"
 
 GRADE_LABEL_MAP = {
     '1등급(최선)': '✅ 적극 추천',
@@ -27,6 +28,10 @@ ALERT_LABEL_MAP = {
     '급등': '🔴 급등',
     '1차 경고': '🟡 1차 경고',
     '정상': '정상',
+}
+ALERT_TYPE_DESC = {
+    '급등 시': "선택하신 품목의 가격이 20% 이상 급등했을 때만 알려드려요.",
+    '추천 포함': "1차 경고(10% 이상)부터 급등까지 모두 알려드리고, 대체 식품 추천까지 함께 보내드려요.",
 }
 
 # =========================================================
@@ -115,9 +120,12 @@ def subscribe_item(chat_id, item_name, alert_type):
             subscribers.append(new_sub)
             with open(SUBSCRIBERS_FILE, 'w') as f:
                 json.dump(subscribers, f)
+            # [변경] 조건 설명 문구 추가
+            desc = ALERT_TYPE_DESC.get(alert_type, "")
             msg = (f"✅ <b>[오르락내리락] 구독 완료!</b>\n\n"
                    f"📍 <b>대상 품목:</b> {item_name}\n"
-                   f"🔔 <b>알림 조건:</b> {alert_type}\n\n"
+                   f"🔔 <b>알림 조건:</b> {alert_type}\n"
+                   f"ℹ️ {desc}\n\n"
                    f"앞으로 설정하신 조건에 맞춰 안내해 드릴게요! 🚀")
             send_telegram_message(TELEGRAM_TOKEN, chat_id, msg)
             return True
@@ -126,7 +134,47 @@ def subscribe_item(chat_id, item_name, alert_type):
         print(f"Subscription Error: {e}")
         return False
 
-def send_daily_alerts(result_df):
+def build_alert_message(row, result_df, base_date):
+    """추천 카드와 동일한 구성으로 텔레그램 알림 메시지를 만듦 (ChatKHU 이유 포함)"""
+    item = row['품목명']
+    alert_badge = "🔴 급등" if row['is_surge'] else ("🟡 1차 경고" if row['is_warning'] else "📈 상승 상위")
+    grade_badge = GRADE_LABEL_MAP.get(row['recommend_grade'], row['recommend_grade'])
+    targets = [t.strip() for t in str(row['recommend_target']).split(',') if t.strip()]
+    target_display = ", ".join(targets) if targets else row['recommend_target']
+    date_str = f"{base_date[:4]}-{base_date[4:6]}-{base_date[6:]}" if base_date else "확인 불가"
+
+    lines = [
+        f"{alert_badge} <b>[오르락내리락] {item} 알림</b>",
+        "",
+        f"📅 기준일: {date_str}",
+        f"📈 1일 등락률: {row['rate_1d']:.1f}%",
+        f"📈 1개월 등락률: {row['rate_1m']:.1f}%",
+        "",
+        f"{grade_badge}: <b>{target_display}</b>",
+    ]
+
+    # 절감액 (1순위 대체재 기준)
+    if targets:
+        item_price = row.get('current_price', 0) or 0
+        t_row = result_df[result_df['품목명'] == targets[0]]
+        if not t_row.empty and item_price > 0:
+            target_price = t_row.iloc[0].get('current_price', 0) or 0
+            if target_price > 0:
+                diff = item_price - target_price
+                if diff > 0:
+                    lines.append(f"💰 {targets[0]}로 바꾸면 약 {diff:,.0f}원 절감돼요")
+
+    # ChatKHU 이유
+    reason = card_message(row, result_df)
+    lines.append("")
+    lines.append(f"💬 {reason}")
+
+    lines.append("")
+    lines.append(f"🔗 자세히 보기: {APP_URL}")
+
+    return "\n".join(lines)
+
+def send_daily_alerts(result_df, base_date):
     """구독자 목록을 돌면서 조건에 맞으면 텔레그램 발송. 관리자 테스트 버튼에서 호출."""
     results = []
     if not os.path.exists(SUBSCRIBERS_FILE):
@@ -153,12 +201,7 @@ def send_daily_alerts(result_df):
         if not should_send:
             continue
 
-        msg = (f"🔔 <b>[오르락내리락] {item} 알림</b>\n\n"
-               f"현재 상태: {row['alert_level']}\n"
-               f"1개월 등락률: {row['rate_1m']:.1f}%\n")
-        if row['recommend_target']:
-            msg += f"추천 대체재: {row['recommend_target']}\n"
-
+        msg = build_alert_message(row, result_df, base_date)
         ok, detail = send_telegram_message(TELEGRAM_TOKEN, chat_id, msg)
         results.append({'item': item, 'ok': ok, 'detail': detail})
 
@@ -216,7 +259,6 @@ def render_card(row, result_df):
         if st.session_state.get(reason_key):
             st.caption(f"이유: {st.session_state[reason_key]}")
 
-        # [변경] 다시 막대그래프로
         if targets and st.session_state.get(chart_key):
             chart_df = pd.DataFrame(index=['1일 등락률(%)', '1개월 등락률(%)'])
             chart_df[item_name] = [row['rate_1d'], row['rate_1m']]
@@ -246,10 +288,9 @@ def main():
     st.sidebar.header("📂 메뉴")
     menu = st.sidebar.radio("이동하기", ["🏠 홈 (대시보드)", "📖 서비스 소개", "🔔 챗봇 구독하기"])
 
-    # [재추가] 관리자 테스트 패널
     with st.sidebar.expander("🛠️ 관리자 테스트"):
         if st.button("지금 바로 데일리 알림 테스트"):
-            test_results = send_daily_alerts(result_df)
+            test_results = send_daily_alerts(result_df, base_date)
             if not test_results:
                 st.info("조건에 맞는 구독/알림 대상이 없습니다.")
             else:
@@ -375,6 +416,8 @@ def main():
 가격 변동이 있는 품목이 많을 땐 전부 보여드리는 대신, **급등 품목을 먼저 채우고** 자리가 남으면 **1차 경고 품목 중 변동이 큰 순서대로** 채워서 최대 9개까지만 카드로 보여드려요.
 
 카드의 "📊 그래프 보기"를 누르면 급등 품목과 대체 품목의 등락률을 나란히 비교하는 그래프가 뜨고, "💬 이유 보기"를 누르면 AI가 그 자리에서 바로 설명을 만들어드려요. 둘 다 필요할 때만 눌러서 보는 방식이라 화면이 깔끔하고 더 빨라요.
+
+챗봇으로 받는 알림도 똑같은 구성으로 발송돼요.
         """)
 
         st.subheader("📋 전체 품목 현황 표는 이렇게 읽어요")
@@ -426,7 +469,6 @@ def main():
 
         item_options = sorted(master_df['품목명'].unique())
         selected_items = st.multiselect("알림을 받고 싶은 품목을 선택하세요", item_options)
-        # [확인용] 실제로 몇 개 품목이 선택 가능한지 바로 보이게
         st.caption(f"총 {len(item_options)}개 품목 중에서 선택할 수 있어요.")
 
         alert_option = st.radio(
@@ -434,6 +476,7 @@ def main():
             ["🚨 품목 가격이 급등할 때만", "💡 추천 제품이 떴을 때도 포함"],
             index=0
         )
+        st.caption(ALERT_TYPE_DESC["급등 시"] if alert_option.startswith("🚨") else ALERT_TYPE_DESC["추천 포함"])
 
         option_map = {
             "🚨 품목 가격이 급등할 때만": "급등 시",
