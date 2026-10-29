@@ -8,6 +8,7 @@
 # =========================================================
 import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -60,7 +61,7 @@ def _fetch_all_with_fallback(ctgry_codes, key):
     '데이터가 있고 + 1일/1개월 등락률이 충분히 채워진 첫 날짜'의 전체 데이터를 반환.
     (월요일처럼 전날 시세가 없으면 1일 등락률이 null로 와서 그 날짜는 건너뜀)
     """
-    today = datetime.now()
+    today = datetime.now(ZoneInfo("Asia/Seoul"))
     for back in range(MAX_FALLBACK_DAYS + 1):
         ymd = (today - timedelta(days=back)).strftime("%Y%m%d")
         all_items = []

@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import requests
 import os
+import html
 from api_client import load_master_data
 from llm_message import card_message
 
@@ -30,8 +31,8 @@ ALERT_LABEL_MAP = {
     '정상': '정상',
 }
 ALERT_TYPE_DESC = {
-    '급등 시': "선택하신 품목의 가격이 20% 이상 급등했을 때만 알려드려요.",
-    '추천 포함': "1차 경고(10% 이상)부터 급등까지 모두 알려드리고, 대체 식품 추천까지 함께 보내드려요.",
+    '급등 시': "1일·1개월 가격 변동을 종합한 점수가 20점 이상일 때만 알려드려요. (1개월 변동을 더 크게 반영해요)",
+    '추천 포함': "점수가 10점 이상(1차 경고)부터 20점 이상(급등)까지 모두 알려드리고, 대체 식품 추천까지 함께 보내드려요.",
 }
 
 # =========================================================
@@ -110,29 +111,35 @@ def run_grade_logic(df, group_col='조리 용도', name_col='품목명',
     return df
 
 def subscribe_item(chat_id, item_name, alert_type):
+    """반환: 'ok'=신규 구독 / 'dup'=이미 구독 중 / 'fail'=전송 실패(저장 안 함)"""
     try:
-        if not os.path.exists(SUBSCRIBERS_FILE):
-            with open(SUBSCRIBERS_FILE, 'w') as f: json.dump([], f)
-        with open(SUBSCRIBERS_FILE, 'r') as f:
-            subscribers = json.load(f)
+        subscribers = []
+        if os.path.exists(SUBSCRIBERS_FILE):
+            with open(SUBSCRIBERS_FILE, 'r', encoding='utf-8') as f:
+                subscribers = json.load(f)
+
         new_sub = {'chat_id': str(chat_id), 'item': item_name, 'alert_type': alert_type}
-        if new_sub not in subscribers:
-            subscribers.append(new_sub)
-            with open(SUBSCRIBERS_FILE, 'w') as f:
-                json.dump(subscribers, f)
-            # [변경] 조건 설명 문구 추가
-            desc = ALERT_TYPE_DESC.get(alert_type, "")
-            msg = (f"✅ <b>[오르락내리락] 구독 완료!</b>\n\n"
-                   f"📍 <b>대상 품목:</b> {item_name}\n"
-                   f"🔔 <b>알림 조건:</b> {alert_type}\n"
-                   f"ℹ️ {desc}\n\n"
-                   f"앞으로 설정하신 조건에 맞춰 안내해 드릴게요! 🚀")
-            send_telegram_message(TELEGRAM_TOKEN, chat_id, msg)
-            return True
-        return False
+        if new_sub in subscribers:
+            return 'dup'
+
+        desc = ALERT_TYPE_DESC.get(alert_type, "")
+        msg = (f"✅ <b>[오르락내리락] 구독 완료!</b>\n\n"
+               f"📍 <b>대상 품목:</b> {item_name}\n"
+               f"🔔 <b>알림 조건:</b> {alert_type}\n"
+               f"ℹ️ {desc}\n\n"
+               f"앞으로 설정하신 조건에 맞춰 안내해 드릴게요! 🚀")
+
+        ok, _ = send_telegram_message(TELEGRAM_TOKEN, chat_id, msg)
+        if not ok:
+            return 'fail'
+
+        subscribers.append(new_sub)
+        with open(SUBSCRIBERS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(subscribers, f, ensure_ascii=False)
+        return 'ok'
     except Exception as e:
         print(f"Subscription Error: {e}")
-        return False
+        return 'fail'
 
 def build_alert_message(row, result_df, base_date):
     """추천 카드와 동일한 구성으로 텔레그램 알림 메시지를 만듦 (ChatKHU 이유 포함)"""
@@ -167,7 +174,7 @@ def build_alert_message(row, result_df, base_date):
     # ChatKHU 이유
     reason = card_message(row, result_df)
     lines.append("")
-    lines.append(f"💬 {reason}")
+    lines.append(f"💬 {html.escape(reason)}")
 
     lines.append("")
     lines.append(f"🔗 자세히 보기: {APP_URL}")
@@ -349,7 +356,8 @@ def main():
             warnings = int(result_df['is_warning'].sum())
             st.metric("🟡 1차 경고 품목", f"{warnings}개")
         with m_col3:
-            avg_rate = result_df['rate_1m'].mean()
+            valid_rates = result_df.loc[result_df['has_data'], 'rate_1m']
+            avg_rate = valid_rates.mean() if not valid_rates.empty else 0.0
             st.metric("📈 평균 등락률(1개월)", f"{avg_rate:.1f}%")
         with m_col4:
             rec_count = len(result_df[result_df['recommend_target'] != ''])
@@ -386,12 +394,12 @@ def main():
         st.divider()
         st.subheader("📈 가격 변화는 이렇게 알려드려요")
         st.warning("""
-**🟡 1차 경고 · 가격 상승률 10% 이상 ~ 20% 미만**
+**🟡 1차 경고 · 가격 변동 점수 10 이상 ~ 20 미만**
 
-가격이 오르고 있어요. 구매하기 전에 가격 변화를 한 번 살펴보세요.
+최근 1일·1개월 등락률을 함께 반영한 점수 기준이에요(1개월 변동 비중이 더 커요). 가격이 오르고 있으니 구매 전에 한 번 살펴보세요.
         """)
         st.error("""
-**🔴 가격 급등 · 가격 상승률 20% 이상**
+**🔴 가격 급등 · 가격 변동 점수 20 이상**
 
 가격이 크게 올랐어요. 비슷한 용도로 활용할 수 있는 대체 식품을 확인해 보세요.
         """)
@@ -498,9 +506,13 @@ https://t.me/oreurak_bot
             if not user_id.strip():
                 st.warning("Chat ID를 입력해주세요.")
             elif selected_items:
-                for item in selected_items:
-                    subscribe_item(user_id, item, option_map[alert_option])
-                st.success(f"{len(selected_items)}개 품목 구독이 완료되었습니다!")
+                results = [subscribe_item(user_id.strip(), item, option_map[alert_option]) for item in selected_items]
+                if 'fail' in results:
+                    st.error("텔레그램 전송에 실패했어요. Chat ID가 맞는지, 봇에서 [시작]을 눌렀는지 확인해 주세요.")
+                else:
+                    ok_count = results.count('ok')
+                    dup_count = results.count('dup')
+                    st.success(f"신규 {ok_count}개 구독 완료" + (f" (이미 구독 중 {dup_count}개 제외)" if dup_count else "!"))
             else:
                 st.warning("품목을 선택해주세요.")
 
